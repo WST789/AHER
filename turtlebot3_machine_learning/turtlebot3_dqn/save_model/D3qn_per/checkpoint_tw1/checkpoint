@@ -1,0 +1,2 @@
+model_checkpoint_path: "/home/wst/catkin_t2/src/turtlebot3_machine_learning/turtlebot3_dqn/save_model/D3qn_per/checkpoint_tw1/D3qn_per_her-600"
+all_model_checkpoint_paths: "/home/wst/catkin_t2/src/turtlebot3_machine_learning/turtlebot3_dqn/save_model/D3qn_per/checkpoint_tw1/D3qn_per_her-600"

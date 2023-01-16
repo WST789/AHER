@@ -1,0 +1,923 @@
+#!/usr/bin/env python
+# -*- coding:utf-8   -*-
+
+from traceback import print_list
+from turtle import position
+import rospy
+import random
+import time
+import math
+from math import pi                                                                #pi 派 3.141596
+import tensorflow as tf
+import numpy as np
+import json
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+from collections import deque
+from std_msgs.msg import Float32MultiArray
+
+# 导入 Env
+from src.turtlebot3_dqn.environment_stage_her846 import Env
+
+# 采用莫烦强化学习教程中的实现
+class SumTree(object):
+    data_pointer = 0
+    def __init__(self, capacity):
+        # capacity 为回放经验的条数
+        self.capacity = capacity
+        # 初始化tree
+        self.tree = np.zeros(2 * capacity - 1)
+        # 初始化回放经验数据
+        self.data = np.zeros(capacity, dtype=object)
+
+    def add(self, p, data):
+        # tree_idx 为所加data在树中的索引号
+        self.tree_idx = self.data_pointer + self.capacity - 1
+        self.data[self.data_pointer] = data
+        # 更新树
+        self.update(self.tree_idx, p)
+        self.data_pointer += 1
+        if self.data_pointer >= self.capacity:
+            self.data_pointer = 0
+
+
+    def update(self, tree_idx, p):
+        change = p - self.tree[tree_idx]
+
+        self.tree[tree_idx] = p
+        # 更新tree的p
+        while tree_idx != 0:
+            # 更新父节点的p值
+            tree_idx = (tree_idx - 1) // 2
+            self.tree[tree_idx] += change
+
+    def get_leaf(self, v):
+        parent_idx = 0
+        # 根据V寻找对应的叶子节点
+        while True:  # the while loop is faster than the method in the reference code
+            cl_idx = 2 * parent_idx + 1  # this leaf's left and right kids
+            cr_idx = cl_idx + 1
+            # 判断是否达到树的底部
+            if cl_idx >= len(self.tree):  # reach bottom, end search
+                leaf_idx = parent_idx
+                break
+            else:  # downward search, always search for a higher priority node
+                if v <= self.tree[cl_idx]:
+                    parent_idx = cl_idx
+                else:
+                    v -= self.tree[cl_idx]
+                    parent_idx = cr_idx
+
+        data_idx = leaf_idx - self.capacity + 1
+        # 输出叶子节点序号，p值，以及对应的数据
+        return leaf_idx, self.tree[leaf_idx], self.data[data_idx]
+
+    @property
+    def total_p(self):
+        return self.tree[0]  # the root
+
+# 采用莫烦强化学习教程中的实现
+class Memory(object):
+    # 实际保存数据的条数
+    saved_size = 0
+    epsilon = 0.01  # 避免 0 priority
+    alpha = 0.6     # [0~1] 将 importance of TD error转化为 priority
+    beta = 0.4      # importance-sampling 从这个初始值增加到1
+    beta_increment_per_sampling = 0.001
+    abs_err_upper = 50.
+
+    def __init__(self, capacity):
+        self.tree = SumTree(capacity)
+
+    def store(self, transition):
+        # 将新加入的transition 优先级p设为最高
+        max_p = np.max(self.tree.tree[-self.tree.capacity:])
+        if max_p == 0:
+            max_p = self.abs_err_upper
+        self.tree.add(max_p, transition)
+        if self.saved_size < self.tree.capacity:
+            self.saved_size += 1
+
+    def sample(self, n):
+        # 初始化 b_idx, b_memory, ISWeights
+        b_idx, ISWeights = np.empty((n,), dtype=np.int32), np.empty((n, 1))
+        b_memory = []
+        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
+        # 比原程序减少了计算量
+        min_prob = np.min(self.tree.tree[
+                                  self.tree.capacity - 1:self.tree.capacity - 1 + self.saved_size]) / self.tree.total_p
+        # print(self.tree.tree[self.tree.capacity-1:self.tree.capacity-1+self.saved_size]) 
+
+        # 将total_p分为n份，每一份为pri_seg
+        pri_seg = self.tree.total_p / n
+        for i in range(n):
+            a, b = pri_seg * i, pri_seg * (i + 1)
+            v = random.uniform(a, b)
+            idx, p, data = self.tree.get_leaf(v)
+            prob = p / self.tree.total_p
+            ISWeights[i, 0] = np.power(prob / min_prob, -self.beta)
+            b_idx[i] = idx
+            b_memory.append(data)
+        return b_idx, b_memory, ISWeights
+
+
+    def batch_update(self, tree_idx, abs_errors):
+        abs_errors += self.epsilon      # 避免0
+        clipped_errors = np.minimum(abs_errors, self.abs_err_upper)
+        ps = np.power(clipped_errors, self.alpha)
+        for ti, p in zip(tree_idx, ps):
+             self.tree.update(ti, p)
+
+class DqnAgent():
+
+    def __init__(self,
+                 state_size,
+                 action_size,
+                 learning_rate = 0.00025,
+                 drop_out = 0.2,
+                 discount_factor = 0.99,
+                 epsilon = 1,
+                 epsilon_decay = 0.99,
+                 epsilon_min = 0.05,
+                 episodes = 900,
+                 episode_step = 6000,
+                 target_update = 2000,
+                 memory_size = 1000000,
+                 batch_size = 64,
+                 output_graph = False,
+                 summaries_dir="logs/",
+                 sess=None,
+                 double_dqn = True,
+                 prioritized=False,
+                 dueling=True
+                 ):
+        self.dueling = dueling
+        self.sess = sess
+        self.prioritized = prioritized
+        self.double_dqn = double_dqn
+        # 创建 result 话题
+        self.pub_result = rospy.Publisher('result', Float32MultiArray, queue_size=5)
+        # 初始化 result 话题
+        self.result = Float32MultiArray()
+
+        # 训练时的步数
+        self.global_step = 0
+
+        # 是否输出可视化图形,tensorboard相关
+        self.output_graph = output_graph
+
+        # 获取当前文件完整路径
+        self.dirPath = os.path.dirname(os.path.realpath(__file__))
+        self.dirPath = self.dirPath.replace('turtlebot3_dqn/nodes', 'turtlebot3_dqn/save_model/d3qn_hher/data_tw1_d3qn_') 
+        #print( self.dirPath)
+        # 基于当前路径生成模型保存路径前缀
+        #self.dirPath = self.dirPath+'/save_model/data_'
+
+        # 导入前期训练的模型
+        self.load_model = True
+        self.load_episode = 600
+        # self.load_model = False
+        # self.load_episode =0
+
+        # 状态数
+        self.state_size = state_size
+        # 动作数
+        self.action_size = action_size
+
+        # 最大回合数
+        self.episodes = episodes
+
+        # 单个回合最大步数
+        self.episode_step = episode_step
+
+        # 每2000次更新一次target网络参数
+        self.target_update = target_update
+
+        # 折扣因子 计算reward时用 当下反馈最重要 时间越久的影响越小
+        self.discount_factor = discount_factor
+
+        # 学习率learning_rate  学习率决定了参数移动到最优值的速度快慢。
+        # 如果学习率过大，很可能会越过最优值；反而如果学习率过小，优化的效率可能过低，长时间算法无法收敛。
+        self.learning_rate = learning_rate
+
+        # dropout层的rate
+        self.drop_out = drop_out
+
+        # 初始ϵ——epsilon
+        # 探索与利用原则
+        # 探索强调发掘环境中的更多信息，并不局限在已知的信息中；
+        # 利用强调从已知的信息中最大化奖励；
+        # greedy策略只注重了后者，没有涉及前者；
+        # ϵ-greedy策略兼具了探索与利用，它以ϵ的概率从所有的action中随机抽取一个，以1−ϵ的概率抽取能获得最大化奖励的action。
+        self.epsilon = epsilon
+
+        # 随着模型的训练，已知的信息越来越可靠，epsilon应该逐步衰减
+        self.epsilon_decay = epsilon_decay
+
+        # 最小的epsilon_min，低于此值后不在利用epsilon_decay衰减
+        self.epsilon_min = epsilon_min
+
+        # batch_size 批处理大小
+        # 合理范围内，增大 Batch_Size
+        # 内存利用率提高了，大矩阵乘法的并行化效率提高
+        # 跑完一次epoch（全数据集）所需要的迭代次数减小，对于相同数据量的处理速度进一步加快
+        # 在一定范围内，一般来说batch size越大，其确定的下降方向越准，引起的训练震荡越小
+
+        # 盲目增大batch size 有什么坏处
+        # 内存利用率提高了，但是内存容量可能撑不住了
+        # 跑完一次epoch（全数据集）所需要的迭代次数减少，但是想要达到相同的精度，其所花费的时间大大增加了，从而对参数的修正也就显得更加缓慢
+        # batch size 大到一定的程度，其确定的下降方向已经基本不再变化
+        self.batch_size = batch_size
+
+        # 用于 experience replay 的 agent.memory
+        # DQN的经验回放池(agent.memory)大于train_start才开始训练网络(agent.trainModel)
+        self.train_start = self.batch_size
+
+        # 用队列存储experience replay 数据，并设置队列最大长度
+        if self.prioritized:
+            self.memory = Memory(capacity=memory_size)
+        else:
+            self.memory = deque(maxlen=memory_size)
+
+        # tensorboard保存路径
+        self.summaries_dir = summaries_dir
+
+        # 创建网络模型 [target_net, evaluate_net]
+        self._buildModel()
+
+        # 利用eval_net网络参数给target_net网络赋值
+        t_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_net')
+        e_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='eval_net')
+
+        with tf.variable_scope('soft_replacement'):
+            self.target_replace_op = [tf.assign(t, e) for t, e in zip(t_params, e_params)]
+
+        if sess is None:
+            self.sess = tf.Session()
+        else:
+            self.sess = sess
+
+        # tensorboard 可视化相关
+        if self.output_graph:
+            # 终端中执行 tensorboard --logdir=logs 命令，浏览器中输入 http://127.0.0.1:6006/ 可在tensorboard查看模型与数据
+            # merged 也是一个操作，在训练时执行此操作
+            self.merged = tf.summary.merge_all()
+            # 创建 summary_writer
+            self.summary_writer = tf.summary.FileWriter("logs/", self.sess.graph)
+            print(self.summary_writer)
+
+        # 2小时最多存5次
+        self.saver = tf.train.Saver(max_to_keep=5, keep_checkpoint_every_n_hours=2)
+
+        self.sess.run(tf.global_variables_initializer())
+
+        # 训练可以加载之前保存的模型参数进行
+        if self.load_model:
+            #self.saver.restore(self.sess, tf.train.latest_checkpoint('./checkpoint_dir/SaveModelDoubleDqnTf')) 
+            #self.saver.restore(self.sess, tf.train.latest_checkpoint('./checkpoint_dir')) 
+            self.saver.restore(self.sess, tf.train.latest_checkpoint('/home/wst/catkin_t2/src/turtlebot3_machine_learning/turtlebot3_dqn/save_model/d3qn_hher/checkpoint_tw1'))
+            with open(self.dirPath + str(self.load_episode) + '.json') as outfile:
+                param = json.load(outfile)
+                self.epsilon = param.get('epsilon')
+                # wsc self.epsilon = 0.5
+                self.epsilon = 0.5
+
+    def _buildModel(self):
+
+        # ------------------ all inputs -----------------------------
+        self.s = tf.placeholder(tf.float32, shape=[None, self.state_size], name='s')
+        self.s_ = tf.placeholder(tf.float32, shape=[None, self.state_size], name='s_')
+        self.q_target = tf.placeholder(tf.float32, [None, self.action_size], name='q_target')
+
+        if self.prioritized:
+            self.ISWeights = tf.placeholder(tf.float32, [None, 1], name='IS_weights')
+
+        # self.a = tf.placeholder(tf.int32, shape=[None, ], name='a')
+
+        # net_config
+        w_initializer = tf.random_normal_initializer(0., 0.3)
+        b_initializer = tf.constant_initializer(0.1)
+
+        # ------------------ built evaluate_net ---------------------
+        with tf.variable_scope('eval_net'):
+            e1 = tf.layers.dense(self.s, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+                                 bias_initializer = b_initializer, name = 'e1')
+            e2 = tf.layers.dense(e1, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+                                 bias_initializer = b_initializer, name = 'e2')
+            e3 = tf.layers.dense(e2, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+                                 bias_initializer = b_initializer, name = 'e3')        
+            # e4 = tf.layers.dense(e3, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+            #                      bias_initializer = b_initializer, name = 'e4')                 
+            e4 = tf.layers.dropout(e3, rate=self.drop_out, name='eval_drop_out')
+            # self.q_eval = tf.layers.dense(e3, self.action_size,activation=tf.nn.softmax,kernel_initializer=w_initializer,
+            #                               bias_initializer=b_initializer, name='q')
+
+            if self.dueling:
+                with tf.variable_scope('value'):
+                    self.base_value = tf.layers.dense(e4, 1, kernel_initializer=w_initializer,
+                                                      bias_initializer = b_initializer, name = 'value')
+                with tf.variable_scope('advantage'):
+                    self.advantage_value = tf.layers.dense(e4, self.action_size,
+                                                           kernel_initializer=w_initializer,
+                                                           bias_initializer = b_initializer, name = 'advantage')
+                with tf.variable_scope('Q'):
+                    self.q_eval = self.base_value + (self.advantage_value - tf.reduce_mean(self.advantage_value, axis=1, keep_dims=True))
+            else:
+                self.q_eval = tf.layers.dense(e4, self.action_size, kernel_initializer=w_initializer,
+                                              bias_initializer = b_initializer, name = 'q')
+
+        with tf.variable_scope('loss'):
+            if self.prioritized:
+                self.abs_errors = tf.reduce_sum(tf.abs(self.q_target - self.q_eval), axis=1)    # for updating Sumtree
+                self.loss = tf.reduce_mean(self.ISWeights * tf.squared_difference(self.q_target, self.q_eval, name='TD_error'))
+            else:
+                self.loss = tf.reduce_mean(tf.squared_difference(self.q_target, self.q_eval, name='TD_error'))
+
+        # 添加scalar类型summary
+        tf.summary.scalar('loss', self.loss)
+
+        with tf.variable_scope('train'):
+            self._train_op = tf.train.RMSPropOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
+
+        # ------------------ built target_net -----------------------
+        with tf.variable_scope('target_net'):
+            t1 = tf.layers.dense(self.s_, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+                                 bias_initializer = b_initializer, name = 't1')
+            t2 = tf.layers.dense(t1, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+                                 bias_initializer = b_initializer, name = 't2')
+            t3 = tf.layers.dense(t2, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+                                 bias_initializer = b_initializer, name = 't3')
+            # t4 = tf.layers.dense(t3, 64, activation=tf.nn.relu, kernel_initializer=w_initializer,
+            #                      bias_initializer = b_initializer, name = 't4')
+            t4 = tf.layers.dropout(t3, rate=self.drop_out, name='target_drop_out')
+
+            if self.dueling:
+                with tf.variable_scope('t_value'):
+                    self.t_base_value = tf.layers.dense(t4, 1, kernel_initializer=w_initializer,
+                                                        bias_initializer = b_initializer, name = 't_value')
+                with tf.variable_scope('t_advantage'):
+                    self.t_advantage_value = tf.layers.dense(t4, self.action_size, kernel_initializer=w_initializer,
+                                                             bias_initializer = b_initializer, name = 't_advantage')
+                with tf.variable_scope('t_Q'):
+                    self.q_next = self.t_base_value + (self.t_advantage_value - tf.reduce_mean(self.t_advantage_value,
+                                                                                               axis=1, keep_dims=True))
+
+            else:
+                # self.q_next = tf.layers.dense(t3, self.action_size, activation=tf.nn.softmax,
+                #                               kernel_initializer=w_initializer,
+                #                               bias_initializer=b_initializer, name='t3')
+                self.q_next = tf.layers.dense(t4, self.action_size, kernel_initializer = w_initializer,
+                                              bias_initializer = b_initializer, name = 't4')
+
+    # 训练网络模型
+    def trainModel(self, target=False):
+        # 每经过target_update，更新target网络参数
+        if self.global_step % self.target_update == 0:
+            self.updateTargetModel()
+            rospy.loginfo("UPDATE TARGET NETWORK")
+            print("UPDATE TARGET NETWORK")
+
+        if self.prioritized:                                                                   #取样
+            tree_idx, mini_batch, ISWeights = self.memory.sample(self.batch_size)
+            if mini_batch[1]==0:
+                tree_idx, mini_batch, ISWeights = self.memory.sample(self.batch_size)
+                # mini_batch = random.sample(self.memory, self.batch_size)
+        else:
+            mini_batch = random.sample(self.memory, self.batch_size)
+        # print(mini_batch)
+
+        state_batch = np.empty((0, self.state_size), dtype=np.float64)
+        action_batch = np.empty((0,), dtype=np.float64)
+        reward_batch = np.empty((0,), dtype=np.float64)
+        state_next_batch = np.empty((0, self.state_size), dtype=np.float64)
+        q_target_batch = np.empty((0, self.action_size), dtype=np.float64)
+
+        for i in range(self.batch_size):
+            # states: [-0.25  0.  ]
+            # states.reshape(1, len(states)):[[-0.5  0. ]] ,一行数据
+            # print(mini_batch[i]) (array([-0.5,  0. ]), 2, 0, array([-0.25,  0.  ]), False)
+            state = mini_batch[i][0]
+            action = mini_batch[i][1]
+            reward = mini_batch[i][2]
+            next_state = mini_batch[i][3]
+            # done = mini_batch[i][4]
+
+            # state=state.reshape(1,len(state))
+            # next_state=next_state.reshape(1,len(next_state))
+
+            # 将next_state 分别送入 target_net 与 eval_net 分别获得 q_next, q_eval_next
+            q_next, q_eval_next = self.sess.run([self.q_next, self.q_eval],
+                feed_dict = {self.s_: [next_state], self.s: [next_state]})
+
+            # 将 state 送入  eval_net  获得  q_eval
+            q_eval = self.sess.run(self.q_eval, {self.s: [state]})           ##
+
+            q_target = q_eval.copy()
+
+            if self.double_dqn:
+                # double DQN
+                # 选择 q_eval_next 向量中最大值对应的动作序号
+                max_act_next_state = np.argmax(q_eval_next, axis=1)
+                # Double DQN, 根据动作序号选择 q_next 值
+                selected_q_next = q_next[0, max_act_next_state]
+            else:
+                # DQN
+                selected_q_next = np.max(q_next, axis=1)
+
+            q_target[0, action] = reward + self.discount_factor * selected_q_next
+
+            state_batch = np.append(state_batch, np.array([state.copy()]), axis=0)
+
+            q_target_batch = np.append(q_target_batch, np.array(q_target.copy()), axis=0)
+
+            action_batch = np.append(action_batch, np.array([action]), axis=0)
+            reward_batch = np.append(reward_batch, np.array([reward]), axis=0)
+            state_next_batch = np.append(state_next_batch, np.array([next_state.copy()]), axis=0)
+
+        # tensorboard 可视化相关
+        if self.output_graph:
+            if self.prioritized:
+                summary, _, abs_errors, self.cost, self.q_value =\
+                    self.sess.run([self.merged, self._train_op, self.abs_errors, self.loss, self.q_eval],
+                              feed_dict = {self.s: state_batch, self.q_target: q_target_batch,
+                                           self.ISWeights: ISWeights})
+                self.memory.batch_update(tree_idx, abs_errors)
+            else:
+                # 这里运行了self.merged操作
+                summary, _, self.q_value = self.sess.run([self.merged, self._train_op, self.q_eval],
+                                                         feed_dict = {self.s: state_batch,
+                                                                      self.q_target: q_target_batch})
+                # 保存 summary
+                self.summary_writer.add_summary(summary, self.global_step)
+        else:
+            if self.prioritized:
+                _, abs_errors, self.cost, self.q_value = self.sess.run(
+                    [self._train_op, self.abs_errors, self.loss, self.q_eval],
+                    feed_dict = {self.s: state_batch,
+                                 self.q_target: q_target_batch,
+                                 self.ISWeights: ISWeights})
+                self.memory.batch_update(tree_idx, abs_errors)
+            else:
+                _, self.q_value = self.sess.run([self._train_op, self.q_eval],
+                                                feed_dict = {self.s: state_batch,
+                                                             self.q_target: q_target_batch})
+
+    def updateTargetModel(self):
+        self.sess.run(self.target_replace_op)
+        print('\ntarget_params_replaced\n')
+
+    def appendMemory(self, state, action, reward, next_state, done):
+        if self.prioritized:
+            transition = (state, action, reward, next_state)
+            self.memory.store(transition)
+        else:
+            self.memory.append((state, action, reward, next_state, done))
+
+    # 基于ϵ——epsilon策略选择动作
+    def chooseAction(self, state):
+        if np.random.rand() <= self.epsilon:
+            action = random.randrange(self.action_size)
+            return action
+
+        else:
+            actions_value = self.sess.run(self.q_eval, feed_dict={self.s: [state]})
+            self.q_value = actions_value
+            action = np.argmax(actions_value)
+            return action
+
+
+    def getnewState_goal(self,state,position,yaw,goal_her):                                        ##获取新的状态her。state状态，position位置对应坐标
+        ##计算heading,current_distance，新的目标位置
+        heading = 0
+        goal_x =round(goal_her.x,1)             ##一位小数
+        goal_y =round(goal_her.y,1)
+        goal_angle = math.atan2(goal_y- position.y, goal_x -position.x)
+        heading = goal_angle - yaw
+        if heading > pi:
+            heading -= 2 * pi
+
+        elif heading < -pi:
+            heading += 2 * pi
+                                                                       
+        heading = round(heading, 2)    
+        current_distance =  round(math.hypot(goal_x -position.x,goal_y- position.y),2)    
+        state = state[:-4]
+        state = np.append(state ,heading)
+        state = np.append(state ,current_distance)
+        state = np.append(state ,goal_x)
+        state = np.append(state ,goal_y)
+        
+        # state = state +[heading,current_distance,goal_her.x,goal_her.y]                                           ##新的state
+        # print('添加成功')
+        # print(type(state))
+        # print(state)
+        # print(len(state))
+        return state
+
+
+
+    # def setnew_RewardDone(self,state, action):                   #设置新的奖励和done
+    #     #print(state)
+    #     #print(action)                                           #action 0 1 2 3 4
+    #     yaw_reward = []
+    #     current_distance = state[-3]               ##
+    #     heading = state[-4]                                 ##
+    #     goal_x =state[-2]
+    #     goal_y =state[-1]
+    #     min_range = 0.13
+    #     done = False
+
+    #     ##设置新的奖励
+    #     for i in range(5):                                                                               #5,动作是5维
+    #         angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
+    #         tr = 1 - 4 * math.fabs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * math.pi) / math.pi)[0])
+    #         yaw_reward.append(tr)
+    #     #print('yaw_reward:',yaw_reward)                        #5维
+    #     goal_distance = round(math.hypot(goal_x - 0, goal_y - 0), 2)
+    #     distance_rate = 2 ** (current_distance / goal_distance)
+    #     reward = ((round(yaw_reward[action] * 5, 2)) * distance_rate)                                    #奖励
+        
+    #     ##设置新的done
+    #     scan_range = state[:-4]
+    #     if min_range > min(scan_range) > 0:                  #min(scan_range)最小的scan_range
+    #         done = True                                      #done为true,撞击，发生碰撞
+
+        
+    #     if done:                              #done为true,撞击，发生碰撞，-200
+    #         reward = -200                     #-200    ?？
+   
+       
+    #     return reward,done
+    def setnew_RewardDone(self,state, action,goal_her):                   #设置新的奖励和done
+        #print(state)
+        #print(action)                                           #action 0 1 2 3 4
+        yaw_reward = []
+        current_distance = state[-3]               ##
+        # print('state:',state)
+        # print('current_distance:',current_distance)
+        heading = state[-4]                                 ##
+        goal_x =round(goal_her.x,1)             ##一位小数
+        goal_y =round(goal_her.y,1)
+        # print(goal_x,goal_y)
+        min_range = 0.13
+        done = False
+
+        #设置新的奖励
+        for i in range(5):                                                                               #5,动作是5维
+            angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
+            tr = 1 - 4 * math.fabs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * math.pi) / math.pi)[0])
+            yaw_reward.append(tr)
+        #print('yaw_reward:',yaw_reward)                        #5维
+        goal_distance = round(math.hypot(goal_x - 0, goal_y - 0), 2)
+        # print(goal_distance,current_distance )
+        if current_distance == 0:
+            done =True                                                                                                                   ##到达
+            reward =100
+        else:
+            distance_rate = 2 ** (current_distance / (goal_distance+0.1))              ##
+            reward = ((round(yaw_reward[action] * 5, 2)) * distance_rate)                                    #奖励
+        
+      
+        
+        # reward = 0
+
+        ##设置新的done
+        scan_range = state[:-4]                           ##
+
+        if(0.13<abs(min(scan_range))<0.5):                                                    ##防止撞击
+            reward-=(0.5-abs(min(scan_range)))*5
+        # print(scan_range)
+        # print(scan_range)
+        # print(done)
+        if min_range > min(scan_range) > 0:                  #min(scan_range)最小的scan_range        ?????
+            done = True                                      #done为true,撞击，发生碰撞
+            reward = -200                     #-200 -50  ?？
+        
+        # if done:                              #done为true,撞击，发生碰撞，-200
+        #     reward = -200                     #-200    ?？
+   
+        if current_distance<0.3:
+            done = True
+            reward =100
+            # reward-=(0.5-abs(min(scan_range)))*20                      ##
+        # print(reward)
+        return reward,done
+
+
+    def Choose_episode_HER(self, states, actions, next_states,positions,yaws):   ##
+        ChooseGoal=[]
+        T = len(actions)
+        for t in range(1,T-20 ):      #1-T-6                   ##不从0开始是因为0是起点
+            # print(t)
+            goal_her = positions[t]     ##T-2
+            score_c=0
+            for i in range(0,t+1):
+                # state_c=[]
+                state_goal = self.getnewState_goal(states[i],positions[i],yaws[i],goal_her)
+                if i==0:
+                    state_c=state_goal
+                next_state_goal = self.getnewState_goal(next_states[i],positions[i+1],yaws[i+1],goal_her) 
+                reward,done = self.setnew_RewardDone( next_state_goal ,actions[i],goal_her)
+                # state_c.append(state_goal)
+                print(reward)
+                score_c=score_c+reward
+                #if reward==100:                                     ##新条件
+                #    break
+            print('score',score_c)
+            V=self.sess.run(self.q_eval, {self.s: [state_c]})  
+            selected_q_next = np.max(V, axis=1)
+            # print('V',V)
+            Choose_value=score_c-selected_q_next
+            # Choose_value=score_c
+            ChooseGoal.append(Choose_value)
+        print('CG',ChooseGoal)
+        # Choose_value = Choose_value.tolist()
+        if ChooseGoal!=[]:
+           Goal_index=ChooseGoal.index(max(ChooseGoal))
+        else:
+            # Goal_index=T-1
+            Goal_index=0
+            print('Goal_index')
+        return Goal_index
+
+    def store_episode_hHER(self, states, actions, next_states,positions,yaws):   ##
+        T = len(actions)
+        k = 4
+        # goal_her_num= self.Choose_episode_HER(states, actions, next_states,positions,yaws)
+                                                            ##没有第一个state？?  从1开始，没有最后一个，range()是从0开始的
+        for kn in range(k):
+            if(T<=4):
+                break
+            randomt=np.random.randint(1,T)
+            print(T,randomt)
+            goal_her_num = np.random.randint(randomt, T)  # select random index from future experience in episode   包括前面，不包括后面
+            print(T,goal_her_num)
+            goal_her=positions[goal_her_num]  
+            # print(goal_her)
+            kn+=1
+            for t in range(0,goal_her_num+1):      #0-新的目标点
+                # print(t)
+                # goal_her = positions[T-10]     ##T-2
+                # print(states[t],next_states[t])
+                state_goal = self.getnewState_goal(states[t],positions[t],yaws[t],goal_her)
+                next_state_goal = self.getnewState_goal(next_states[t],positions[t+1],yaws[t+1],goal_her) 
+                reward,done = self.setnew_RewardDone( next_state_goal ,actions[t],goal_her)
+                if done==True:
+                    self.appendMemory(state_goal, actions[t], reward, next_state_goal, done)              ##有一个到达点
+                    print('True',reward)
+                    break
+                self.appendMemory(state_goal, actions[t], reward, next_state_goal, done)
+
+    def store_episode_HER(self, states, actions, next_states,positions,yaws):   ##
+        T = len(actions)
+        goal_her_num= self.Choose_episode_HER(states, actions, next_states,positions,yaws)
+        print(T,goal_her_num)
+        goal_her=positions[goal_her_num]  
+        # print(goal_her)
+        for t in range(0,goal_her_num+1):      #0-新的目标点
+            # print(t)
+            # goal_her = positions[T-10]     ##T-2
+            # print(states[t],next_states[t])
+            state_goal = self.getnewState_goal(states[t],positions[t],yaws[t],goal_her)
+            next_state_goal = self.getnewState_goal(next_states[t],positions[t+1],yaws[t+1],goal_her) 
+            reward,done = self.setnew_RewardDone( next_state_goal ,actions[t],goal_her)
+            if done==True:
+                self.appendMemory(state_goal, actions[t], reward, next_state_goal, done)              ##有一个到达点
+                print('True',reward)
+                break
+            self.appendMemory(state_goal, actions[t], reward, next_state_goal, done)
+        
+    def store_episode_HER_collision(self, states, actions, next_states,dones):   ##
+        T = len(actions)
+        num=1
+        for c in range(T-6,T-1):   #T-6~T-2
+            reward=-10*num
+            print(reward,num)
+            self.appendMemory(states[c], actions[c], reward, next_states[c], dones[c])    
+            num=num+1
+
+
+
+        
+
+
+                    
+if __name__ == '__main__':
+
+    rospy.init_node('turtlebot3_dqn_stage_1_tensorflow')
+    pub_result = rospy.Publisher('result', Float32MultiArray, queue_size=5)
+    pub_get_action = rospy.Publisher('get_action', Float32MultiArray, queue_size=5)
+    result = Float32MultiArray()
+    get_action = Float32MultiArray()
+
+    state_size = 28   ##state_goal
+    action_size = 5
+    TrainFlag = False
+
+    env = Env(action_size)
+
+    agent = DqnAgent(state_size, action_size, output_graph=True)
+    scores, episodes = [], []
+    agent.global_step = 0
+    start_time = time.time()
+    Episode_rewards = np.array([])                               #记录奖励分数，用于绘图
+    # goal_num = 0                                                                   ##到达目标点的episode数量
+    Aver_rewards = np.array([])                                      ##记录每个episode平均得分
+    Success_rate = np.array([])
+    Collision_rate = np.array([])
+    Timeout_rate = np.array([])
+    Success_num = 0
+    Collision_num=0
+    Timeout_num=0
+    goal_list=[]
+    coordinate_list=[]
+
+    # 循环EPISODES个回合
+    for e in range(agent.load_episode + 1, agent.episodes+1):
+        done = False
+        state = env.reset()
+        score = 0
+        transition_num =0                                                                   ##一个episode里的transition数
+        
+
+        state_ep, act_ep, reward_ep, next_state_ep, done_ep,position_ep,yaw_ep= [], [], [], [], [],[],[]  ##存储每个episode中所有的s,a,r,s1,done,坐标集合。
+        # 每10个回合保存一次网络模型参数
+        if e % 10 == 0:
+            # 保存参数,不保存graph结构
+            #agent.saver.save(agent.sess, "./checkpoint_dir/SaveModelDoubleDqnTf", global_step=e, write_meta_graph=True)
+            agent.saver.save(agent.sess, "/home/wst/catkin_t2/src/turtlebot3_machine_learning/turtlebot3_dqn/save_model/d3qn_hher/checkpoint_tw1/D3qn_per_her", global_step=e, write_meta_graph=True)
+            print(agent.sess)
+            param_keys = ['epsilon']
+            param_values = [agent.epsilon]
+            param_dictionary = dict(zip(param_keys, param_values))
+            with open(agent.dirPath + str(e) + '.json', 'w+') as outfile:
+                json.dump(param_dictionary, outfile)
+                print('epsilon saver')
+
+        # 每个回合循环episode_step步
+        for t in range(agent.episode_step):
+            # 选择动作
+            action = agent.chooseAction(state)
+            # Env动作一步，返回next_state, reward, done
+            next_state, reward, done,done_d3qn,position,yaw= env.step(action)           ##position是state的坐标
+            agent.appendMemory(state, action, reward, next_state, done)       ##
+            # print(state,next_state)
+            
+
+
+            state_ep.append(state.copy())             #copy？
+            act_ep.append(action)
+            reward_ep.append(reward)
+            next_state_ep.append(next_state.copy())
+
+            coo_x=position.x                                                                           ##############path
+            coo_y=position.y
+            coo=np.asarray ([coo_x, coo_y])
+            coordinate_list.append(coo.copy())
+           
+            position_ep.append(position)
+            yaw_ep.append(yaw)
+
+           
+            if agent.global_step >= agent.train_start:
+                if agent.global_step <= agent.target_update:
+                    agent.trainModel()
+                else:
+                    agent.trainModel(True)
+                    TrainFlag=True
+
+            # 将回报值累加成score
+            score += reward
+            transition_num+=1                                                    ##
+
+
+            state = next_state
+            # 发布 get_action 话题
+            get_action.data = [action, score, reward]
+            pub_get_action.publish(get_action)
+            
+            if done==True:
+                Collision_num+=1
+                
+
+            #到达目标点，回合结束
+            if done_d3qn == True:
+                # print(reward)
+                done = True
+                # goal_num+=1
+                Success_num += 1
+                goal_x=state[-2]
+                goal_y=state[-1]
+                goal=np.asarray ([goal_x,goal_y])
+                goal_list.append(goal.copy())
+                print(goal_list)
+
+                import os
+                os.chdir('/home/wst/catkin_t2/src/turtlebot3_machine_learning/turtlebot3_dqn/nodes/rewards') 
+                np.save('coordinate_her.npy',coordinate_list)
+                
+
+            
+
+
+            # 超过500步时设定为超时，回合结束
+            if t >= 500:
+                print("Time out!!")
+                done = True
+                Timeout_num+=1
+
+            # state_ep.append(state.copy())             #copy？
+            # act_ep.append(action)
+            # reward_ep.append(reward)
+            # next_state_ep.append(next_state.copy())
+            done_ep.append(done)
+            # position_ep.append(position)
+            # yaw_ep.append(yaw)
+
+            # if t>=500:
+            #     agent.store_episode_HER(state_ep, act_ep,next_state_ep,position_ep,yaw_ep)
+               
+            if done:
+                # 发布result话题
+                if TrainFlag == False:              #区分开始训练还是在存储记忆时结束
+                    result.data = [score]
+                else:
+                    result.data = [score, np.max(agent.q_value)]
+                pub_result.publish(result)
+
+                scores.append(score)
+                episodes.append(e)
+                # 计算运行时间
+                m, s = divmod(int(time.time() - start_time), 60)
+                h, m = divmod(m, 60)
+
+                rospy.loginfo('Ep: %d score: %.2f global_step: %d epsilon: %.2f time: %d:%02d:%02d', e,
+                              score, agent.global_step, agent.epsilon, h, m, s)
+                Episode_rewards=np.append(Episode_rewards,score)                                  #记录奖励分数，用于绘图
+                break
+
+
+            agent.global_step += 1
+
+        # if done_d3qn != True:
+        #     agent.store_episode_HER(state_ep, act_ep,next_state_ep,position_ep,yaw_ep)  
+       
+        # if score>200 or score<0:
+        # if done_d3qn != True:
+        if score>200:
+            # agent.store_episode_HER(state_ep, act_ep,next_state_ep,position_ep,yaw_ep)                   ## gher
+            agent.store_episode_hHER(state_ep, act_ep,next_state_ep,position_ep,yaw_ep)                     ##  her(furture)
+        # if done_d3qn!=True:
+        #    agent.store_episode_HER_collision(state_ep, act_ep,next_state_ep, done_ep)  
+       # print(reward_ep)
+        
+
+
+        Success_r = (float(Success_num)/float(e-600))
+        # Success_r=round(Success_r,2)
+        # print(Success_r)
+        Success_r=Success_r*100
+        print(Success_r)
+        Success_rate =np.append(Success_rate,Success_r)
+        print(Success_num,Success_r,Success_rate)
+
+        
+        Collision_r = (float(Collision_num)/float(e-600))
+        # Success_r=round(Success_r,2)
+        # print(Success_r)
+        Collision_r=Collision_r*100
+        print(Collision_r)
+        Collision_rate =np.append(Collision_rate,Collision_r)
+        # print(Success_num,Success_r,Success_rate)
+
+        Timeout_r = (float(Timeout_num)/float(e-600))
+        # Success_r=round(Success_r,2)
+        # print(Success_r)
+        Timeout_r=Timeout_r*100
+        print(Timeout_r)
+        Timeout_rate =np.append(Timeout_rate,Timeout_r)
+        # print(Success_num,Success_r,Success_rate)
+        
+
+
+            # 更新衰减epsilon值，直到低于等于agent.epsilon_min
+        if agent.epsilon > agent.epsilon_min:
+             agent.epsilon *= agent.epsilon_decay
+    import os
+    #print os.getcwd() 
+    os.chdir('/home/wst/catkin_t2/src/turtlebot3_machine_learning/turtlebot3_dqn/nodes/rewards') 
+    np.save('d3qn_tw1_4layer_D3QNhher0826_other2.npy',Episode_rewards)
+    # print(goal_num)
+    # print(goal_num/agent.episodes)
+    # np.save('Aver_per.npy',Aver_rewards)
+    np.save('Sucess_rate_4layer_D3QNhher0826_other2.npy',Success_rate)
+    np.save('Collision_rate_4layer_D3QNhher0826_other2.npy',Collision_rate)
+    np.save('Timeout_rate_4layer_D3QNhher0826_other2.npy',Timeout_rate)
+    # np.save('goal0809.npy',goal_list)
+
+    
+
+    
+
+
